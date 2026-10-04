@@ -1,94 +1,111 @@
-# Cache Design: Preventing Stale Writes with Invalidation Tokens
+# Invalidation Tokens for Stale Write Prevention in Cache-Aside Systems
 
-## 1. Overview
+## Abstract
 
-Read requests hit the cache first for speed. On a cache miss, the DB is queried and the result is written back to the cache. Cache entries also expire via a TTL (for example, 5 minutes) so they get refreshed from the DB periodically.
+In a cache-aside architecture, asynchronous backfills following a cache miss are susceptible to concurrency race conditions. A delayed write-back can overwrite an explicit cache invalidation triggered by a concurrent database write, leaving stale data in the cache until TTL expiration. 
 
-This design describes a race condition between a cache-fill and a DB update, and a token-based solution that prevents stale data from being written into the cache.
+This document specifies an invalidation token (lease) protocol that guarantees cache consistency by rejecting stale write-backs.
 
-## 2. Basic Read Flow
+---
 
-1. Client sends a request (e.g. price of product `y`).
-2. The cache is checked first.
-3. **Cache hit:** return the cached value.
-4. **Cache miss:** query the DB, return the value, and populate the cache.
-5. TTL (say 5 minutes) expires entries so they are refreshed from the DB.
+## 1. Problem Statement
 
-## 3. The Problem: Stale Write Race Condition
+### 1.1 Standard Cache-Aside Read Flow
 
-Scenario: a customer requests the price of product `y`, and it is not in the cache.
+1. **Client Request**: The client requests a resource key (e.g., `item:1001`).
+2. **Cache Lookup**: On a cache hit, the cached value is returned directly.
+3. **Database Fallback**: On a cache miss, the client reads the source of truth from the primary database, returns the value, and writes the fetched value back to the cache with a predefined Time-To-Live (TTL).
 
-| Step | Event |
-|------|-------|
-| 1 | Cache miss for product `y`. |
-| 2 | DB is queried. Price at this moment is **Rs 50**. |
-| 3 | The value (Rs 50) is on its way to be written into the cache. |
-| 4 | Meanwhile, the price is updated in the DB to **Rs 500**, and the cache entry is invalidated/deleted. |
-| 5 | The delayed write of Rs 50 arrives at the cache and gets stored. |
+### 1.2 Stale Write Race Condition
 
-**Result:** the cache now holds Rs 50 (stale) while the DB holds Rs 500. The stale value stays until the TTL expires, so customers see the wrong price.
+When a database update coincides with an in-flight cache backfill, a race condition can occur:
 
-The root cause is that the in-flight data was already expired (outdated) by the time it reached the cache, but the cache had no way to know.
+| Timeline | Component Action | State |
+| :--- | :--- | :--- |
+| `t0` | Client A reads key `item:1001` | Cache Miss |
+| `t1` | Client A queries Database | Database returns `$50.00` |
+| `t2` | Client B updates `item:1001` in Database to `$500.00` | Database updated to `$500.00` |
+| `t3` | Client B invalidates `item:1001` in Cache | Cache key deleted |
+| `t4` | Client A completes delayed backfill (`SET item:1001 = $50.00`) | Stale value cached |
 
-## 4. Solution: Token (Lease) Based Cache Fill
+**Failure Impact**: The cache stores `$50.00` while the database holds `$500.00`. The inconsistent state persists until the entry's TTL expires, exposing downstream clients to stale data.
 
-When a cache miss occurs, the cache issues a **token** to the requester. The requester must present this token when writing the fetched value back. If the token is no longer valid, the write is rejected.
+---
 
-### 4.1 Rules
+## 2. Solution: Lease-Based Invalidation Tokens
 
-1. On a cache miss, the cache generates a unique token tied to that key and returns it with the miss response.
-2. The requester reads from the DB and sends `(key, value, token)` to the cache.
-3. The cache accepts the write **only if the token is still valid** for that key.
-4. When the key is invalidated (DB update, delete, or TTL expiry), the cache deletes the key **and all tokens associated with it**.
-5. A write that arrives with a deleted or expired token is rejected, so the stale value is never stored.
+To prevent stale writes, the cache issues a unique, short-lived **invalidation token** (lease) whenever a cache miss occurs. Clients must supply this token when performing a write-back.
 
-### 4.2 Corrected Flow (same scenario)
+### 2.1 Protocol Rules
 
-| Step | Event |
-|------|-------|
-| 1 | Cache miss for product `y`; the cache issues **token T1**. |
-| 2 | DB is queried; price is Rs 50. |
-| 3 | Rs 50 + T1 is on its way to the cache. |
-| 4 | Price is updated to Rs 500 in the DB; the delete/invalidate removes the key **and token T1**. |
-| 5 | Rs 50 + T1 reaches the cache; T1 is invalid, so the **write is rejected**. |
-| 6 | The next request misses again, gets a new token T2, reads Rs 500 from the DB, and the write with T2 succeeds. |
+1. **Token Generation**: On a cache miss, the cache generates a unique token $T$ associated with the requested key and returns $(MISS, T)$ to the client.
+2. **Conditional Write**: The client queries the database and sends `SET key value token` to the cache.
+3. **Validation**: The cache accepts and commits the write only if token $T$ is still valid for that key.
+4. **Token Revocation**: Any write, delete, or invalidation operation on a key immediately revokes all outstanding tokens associated with that key.
+5. **Rejection**: Writes bearing revoked or expired tokens are rejected, preventing stale in-flight data from populating the cache.
 
-**Result:** the cache never holds the stale Rs 50, and eventually holds the correct Rs 500.
+### 2.2 Corrected Execution Flow
 
-## 5. Sequence Diagram
+| Timeline | Component Action | Result |
+| :--- | :--- | :--- |
+| `t0` | Client A requests `item:1001` | Cache Miss, Token `T1` issued |
+| `t1` | Client A queries Database | Database returns `$50.00` |
+| `t2` | Client B updates Database (`item:1001` = `$500.00`) | Database updated |
+| `t3` | Client B invalidates `item:1001` in Cache | Key deleted, Token `T1` revoked |
+| `t4` | Client A attempts write (`SET item:1001 = $50.00`, Token `T1`) | **Rejected** (Token `T1` invalid) |
+| `t5` | Subsequent read request for `item:1001` | Cache Miss, Token `T2` issued |
+| `t6` | Subsequent backfill completes with `T2` | **Accepted** (`$500.00` cached) |
+
+---
+
+## 3. Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant Ca as Cache
+    autonumber
+    participant Client as Client A
+    participant Cache as Cache Layer
     participant DB as Database
-    participant W as Writer (price update)
+    participant Writer as Client B (Writer)
 
-    C->>Ca: GET price(y)
-    Ca-->>C: MISS + token T1
-    C->>DB: SELECT price(y)
-    DB-->>C: Rs 50
-    W->>DB: UPDATE price(y) = Rs 500
-    W->>Ca: DELETE key y (also deletes T1)
-    C->>Ca: SET y = 50 (token T1)
-    Ca-->>C: REJECTED (token invalid)
-    C->>Ca: GET price(y)
-    Ca-->>C: MISS + token T2
-    C->>DB: SELECT price(y)
-    DB-->>C: Rs 500
-    C->>Ca: SET y = 500 (token T2)
-    Ca-->>C: OK
+    Client->>Cache: GET item:1001
+    Cache-->>Client: MISS (Token: T1)
+    Client->>DB: SELECT item:1001
+    DB-->>Client: Value: $50.00
+    
+    Writer->>DB: UPDATE item:1001 = $500.00
+    Writer->>Cache: DELETE item:1001 (Revokes T1)
+    
+    Client->>Cache: SET item:1001 = $50.00 (Token: T1)
+    Cache-->>Client: REJECTED (Invalid Token)
+    
+    Client->>Cache: GET item:1001
+    Cache-->>Client: MISS (Token: T2)
+    Client->>DB: SELECT item:1001
+    DB-->>Client: Value: $500.00
+    Client->>Cache: SET item:1001 = $500.00 (Token: T2)
+    Cache-->>Client: OK
 ```
 
-## 6. Design Notes
+---
 
-- **Token scope:** tokens are per key. Invalidating a key invalidates all its outstanding tokens.
-- **Token expiry:** tokens should also have a short lifetime so abandoned fills do not linger.
-- **TTL interaction:** TTL expiry also deletes the key and its tokens, so a fill that straddles a TTL expiry is safely rejected.
-- **Thundering herd (optional):** the cache can issue only one token at a time per key. Other requesters wait briefly or retry, which reduces duplicate DB reads.
-- **Failure behavior:** a rejected write is not an error for the client. The client already has a value to return, and the cache is simply refilled on a later miss.
-- **Trade-off:** a few extra cache misses after invalidations, in exchange for strong protection against stale entries.
+## 4. Technical Considerations
 
-## 7. Summary
+### 4.1 Token Lifetime & Scope
+- **Key-Scoped Isolation**: Tokens are strictly scoped to individual keys. Invalidating key $K$ revokes only the active tokens bound to $K$.
+- **Lease Expiration**: Tokens carry an explicit TTL independent of key TTL to ensure abandoned backfills are purged automatically.
 
-Without tokens, a slow cache-fill can overwrite a newer invalidation with old data. With tokens, every fill must prove that no invalidation happened since the miss. Invalidation removes the token, so stale in-flight data is discarded and the cache stays consistent with the DB.
+### 4.2 Handling TTL Expiration
+- Key expiration triggered by standard TTL sweeps or evictions automatically revokes active tokens associated with that key. A backfill that spans a TTL boundary is safely rejected.
+
+### 4.3 Thundering Herd Mitigation
+- The token mechanism can be extended to issue at most one active lease per key. Concurrent requests during a cache miss can either await the initial backfill or retry, reducing database load spikes.
+
+### 4.4 Failure Semantics
+- A rejected cache write does not constitute an application error. The client returns the fresh database value directly, and subsequent read requests naturally retry the backfill with a new token.
+
+---
+
+## 5. Summary
+
+Invalidation tokens eliminate stale write race conditions by ensuring that every write-back proves no cache invalidation occurred while the database query was in flight. By invalidating tokens alongside keys, stale data is deterministically discarded, maintaining strong cache-to-database consistency.
